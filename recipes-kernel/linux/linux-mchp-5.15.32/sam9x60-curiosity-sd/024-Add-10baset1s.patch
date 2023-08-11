@@ -1,0 +1,681 @@
+diff --git a/drivers/net/usb/Kconfig b/drivers/net/usb/Kconfig
+index b554054a7560..6c3b2cb133bf 100644
+--- a/drivers/net/usb/Kconfig
++++ b/drivers/net/usb/Kconfig
+@@ -130,6 +130,18 @@ config USB_LAN78XX
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called lan78xx.
+ 
++config USB_LAN867X
++	tristate "Microchip LAN867X Based USB Ethernet Adapters"
++	depends on USB_USBNET
++	select PHYLIB
++	select SMSC_PHY
++	select BITREVERSE
++	select CRC16
++	select CRC32
++	help
++	  This option adds support for Microchip LAN867X based USB 2.0
++	  10/100 Ethernet adapters.
++
+ config USB_USBNET
+ 	tristate "Multi-purpose USB Networking Framework"
+ 	select MII
+diff --git a/drivers/net/usb/Makefile b/drivers/net/usb/Makefile
+index 4964f7b326fb..c93619b6ec48 100644
+--- a/drivers/net/usb/Makefile
++++ b/drivers/net/usb/Makefile
+@@ -10,6 +10,7 @@ obj-$(CONFIG_USB_RTL8150)	+= rtl8150.o
+ obj-$(CONFIG_USB_RTL8152)	+= r8152.o
+ obj-$(CONFIG_USB_HSO)		+= hso.o
+ obj-$(CONFIG_USB_LAN78XX)	+= lan78xx.o
++obj-$(CONFIG_USB_LAN867X)	+= lan867x_phy.o
+ obj-$(CONFIG_USB_NET_AX8817X)	+= asix.o
+ asix-y := asix_devices.o asix_common.o ax88172a.o
+ obj-$(CONFIG_USB_NET_AX88179_178A)      += ax88179_178a.o
+@@ -41,4 +42,3 @@ obj-$(CONFIG_USB_NET_QMI_WWAN)	+= qmi_wwan.o
+ obj-$(CONFIG_USB_NET_CDC_MBIM)	+= cdc_mbim.o
+ obj-$(CONFIG_USB_NET_CH9200)	+= ch9200.o
+ obj-$(CONFIG_USB_NET_AQC111)	+= aqc111.o
+-obj-$(CONFIG_USB_RTL8153_ECM)	+= r8153_ecm.o
+diff --git a/drivers/net/usb/lan867x_phy.c b/drivers/net/usb/lan867x_phy.c
+new file mode 100644
+index 000000000000..d6a0090573d4
+--- /dev/null
++++ b/drivers/net/usb/lan867x_phy.c
+@@ -0,0 +1,428 @@
++/*
++ * drivers/net/phy/lan867x_phy.c
++ *
++ * Driver for Microchip 10BASE-T1S LAN867X PHY
++ *
++ * Author: Parthiban Veerasooran
++ * Author: Jan Huber
++ *
++ * Copyright (c) 2018 Microchip Technology Inc.
++ *
++ * This program is free software; you can redistribute  it and/or modify it
++ * under  the terms of  the GNU General  Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/phy.h>
++#include <linux/firmware.h>
++#include <linux/delay.h>
++
++#define LAN867X_PHY_ID_REV_B1                   0x0007C162
++#define LAN867X_PHY_ID_REV_C0                   0x0007C163
++
++#define LAN867X_STS1				0x1F0018
++#define LAN867X_STS2				0x1F0019
++
++static const struct firmware *fw_p;
++
++MODULE_DESCRIPTION("Microchip 10BASE-T1S lan867x Phy driver");
++MODULE_AUTHOR("Parthiban Veerasooran <Parthiban.Veerasooran@microchip.com>");
++MODULE_AUTHOR("Jan Huber <Jan.Huber@microchip.com>");
++MODULE_LICENSE("GPL");
++MODULE_VERSION("0.6");
++
++static int mk_u32(const u8 *ptr, u32 *value)
++{
++	*value = ptr[0] << 24 | ptr[1] << 16 | ptr[2] << 8 | ptr[3];
++	return 4;
++}
++
++static int mk_u16(const u8 *ptr, u16 *value)
++{
++	*value = ptr[0] << 8 | ptr[1];
++	return 2;
++}
++
++static void write_reg(struct phy_device *phydev, u32 addr, u16 val)
++{
++	if (addr > 0xFF)
++		phy_write_mmd(phydev, addr >> 16, addr & 0xFFFF, val);
++	else
++		phy_write(phydev, addr, val);
++}
++
++static int read_reg(struct phy_device *phydev, u32 addr)
++{
++	if (addr > 0xFF)
++		return phy_read_mmd(phydev, addr >> 16, addr & 0xFFFF);
++
++	return phy_read(phydev, addr);
++}
++
++static void read_modify_write(struct phy_device *phydev, u32 addr, u16 mask,
++		u16 data)
++{
++	u16 reg;
++
++	reg = read_reg(phydev, addr) & ~mask;
++	write_reg(phydev, addr, reg | data);
++}
++
++enum { LAN867X_CFG_TYPE = 1 };
++
++static const int opcode_lengts[] = { 6, 8, 10, 10, 2, 12, 12 };
++
++static bool configure(struct phy_device *phydev, const u8 *ptr,
++		const u8 *end)
++{
++	u32 addr;
++	u16 mask, value, skip, reg, count, delay;
++
++	while (ptr < end) {
++		u8 op = *ptr++;
++
++		if (op >= ARRAY_SIZE(opcode_lengts)) {
++			pr_err("bad opcode: %u\n", op);
++			goto err;
++		}
++
++		if (ptr + opcode_lengts[op] > end) {
++			pr_err("bad script format\n");
++			goto err;
++		}
++
++		switch (op) {
++			case 0:
++				ptr += mk_u32(ptr, &addr);
++				ptr += mk_u16(ptr, &value);
++				write_reg(phydev, addr, value);
++				break;
++			case 1:
++				ptr += mk_u32(ptr, &addr);
++				ptr += mk_u16(ptr, &mask);
++				ptr += mk_u16(ptr, &value);
++				reg = read_reg(phydev, addr) & ~mask;
++				write_reg(phydev, addr, reg | value);
++				break;
++			case 2:
++				ptr += mk_u32(ptr, &addr);
++				ptr += mk_u16(ptr, &mask);
++				ptr += mk_u16(ptr, &value);
++				ptr += mk_u16(ptr, &skip);
++				reg = read_reg(phydev, addr) & mask;
++				if (reg == value)
++					break;
++
++				if (!skip) {
++					pr_err("value (*%08x & %04x) == %04x is expected to be %04x\n",
++							addr, mask, reg, value);
++					goto err;
++				}
++				ptr += skip;
++				break;
++			case 3:
++				ptr += mk_u32(ptr, &addr);
++				ptr += mk_u16(ptr, &mask);
++				ptr += mk_u16(ptr, &value);
++				ptr += mk_u16(ptr, &skip);
++				reg = read_reg(phydev, addr) & mask;
++				if (reg != value)
++					break;
++
++				if (!skip) {
++					pr_err("value (*%08x & %04x) is not expected to be %04x\n",
++							addr, mask, reg);
++					goto err;
++				}
++				ptr += skip;
++				break;
++			case 4:
++				ptr += mk_u16(ptr, &skip);
++				ptr += skip;
++				break;
++			case 5:
++				ptr += mk_u32(ptr, &addr);
++				ptr += mk_u16(ptr, &mask);
++				ptr += mk_u16(ptr, &value);
++				ptr += mk_u16(ptr, &count);
++				ptr += mk_u16(ptr, &delay);
++				while ((reg = read_reg(phydev, addr) & mask) != value) {
++					if (!count) {
++						pr_err("value (*%08x & %04x) == %04x is expected to be %04x\n",
++								addr, mask, reg, value);
++						goto err;
++					}
++					mdelay(delay);
++					count--;
++				}
++				break;
++			case 6:
++				ptr += mk_u32(ptr, &addr);
++				ptr += mk_u16(ptr, &mask);
++				ptr += mk_u16(ptr, &value);
++				ptr += mk_u16(ptr, &count);
++				ptr += mk_u16(ptr, &delay);
++				while ((reg = read_reg(phydev, addr) & mask) == value) {
++					if (!count) {
++						pr_err("value (*%08x & %04x) is not expected to be %04x\n",
++								addr, mask, reg);
++						goto err;
++					}
++					mdelay(delay);
++					count--;
++				}
++				break;
++		}
++
++		if (ptr > end) {
++			pr_err("bad script format\n");
++			goto err;
++		}
++	}
++
++	return true;
++
++err:
++	return false;
++}
++
++static int lan867x_configure_plca(struct phy_device *phydev)
++{
++	const u8 *ptr;
++	const u8 *end;
++	u32 type, length, offset;
++	int ret = request_firmware_direct(&fw_p, "lan867x_config.bin", NULL);
++
++	if (ret)
++		return ret;
++
++	ptr = fw_p->data;
++	end = fw_p->data + fw_p->size;
++
++	while (ptr < end) {
++		offset = ptr - fw_p->data;
++		if (ptr + 8 > end) {
++			pr_err("bad TLV format, config offset: %d\n", offset);
++			goto err;
++		}
++		ptr += mk_u32(ptr, &type);
++		ptr += mk_u32(ptr, &length);
++		if (ptr + length > end) {
++			pr_err("bad TLV length, config offset: %d\n", offset);
++			goto err;
++		}
++		if (type == LAN867X_CFG_TYPE) {
++			if (!configure(phydev, ptr, ptr + length))
++				goto err;
++		}
++		ptr += length;
++	}
++
++	release_firmware(fw_p);
++	return 0;
++
++err:
++	release_firmware(fw_p);
++	return -EFAULT;
++}
++
++static int lan867x_rev_b1_config_init(struct phy_device *phydev)
++{
++	phydev->speed = SPEED_10;
++	phydev->autoneg = DUPLEX_HALF;
++
++	read_modify_write(phydev, 0x001F00D0, 0x0E03, 0x0002);
++	read_modify_write(phydev, 0x001F00D1, 0x0300, 0x0000);
++	read_modify_write(phydev, 0x001F0084, 0xFFC0, 0x3380);
++	read_modify_write(phydev, 0x001F0085, 0x000F, 0x0006);
++	read_modify_write(phydev, 0x001F008A, 0xF800, 0xC000);
++	read_modify_write(phydev, 0x001F0087, 0x801C, 0x801C);
++	read_modify_write(phydev, 0x001F0088, 0x1FFF, 0x033F);
++	read_modify_write(phydev, 0x001F008B, 0xFFFF, 0x0404);
++	read_modify_write(phydev, 0x001F0080, 0x0600, 0x0600);
++	read_modify_write(phydev, 0x001F00F1, 0x7F00, 0x2400);
++	read_modify_write(phydev, 0x001F0096, 0x2000, 0x2000);
++	read_modify_write(phydev, 0x001F0099, 0xFFFF, 0x7F80);
++
++	return lan867x_configure_plca(phydev);
++}
++
++static void lan867x_write_register_bits(struct phy_device *phydev, u32 addr, u8 start, u8 end, u16 value)
++{
++	u16 mask = 0;
++	int i;
++
++	for (i=start;i<=end;i++)
++		mask |= 1 << i;
++
++	read_modify_write(phydev, addr, mask, value << start);
++}
++
++static int lan867x_read_efuse_register(struct phy_device *phydev, u32 addr)
++{
++	write_reg(phydev, 0x001F00D8, (addr & 0x000F));
++	write_reg(phydev, 0x001F00DA, 0x0002);
++	mdelay(1);
++	return read_reg(phydev, 0x001F00D9) & 0xFF;
++}
++
++static bool lan867x_trimmed_status(struct phy_device *phydev)
++{
++	return lan867x_read_efuse_register(phydev, 0x5) & 0x40;
++}
++
++static int lan867x_rev_c0_config_init(struct phy_device *phydev)
++{
++	uint8_t efuse_a4_val;
++	uint8_t efuse_a8_val;
++	int8_t efuse_a4_offset;
++	int8_t efuse_a8_offset;
++	bool is_trimmed;
++
++	phydev->speed = SPEED_10;
++	phydev->autoneg = DUPLEX_HALF;
++
++	is_trimmed = lan867x_trimmed_status(phydev);
++
++	if (is_trimmed) {
++		efuse_a4_val = lan867x_read_efuse_register(phydev, 0x4) & 0x1F;
++		if ((efuse_a4_val >= 16) && (efuse_a4_val <= 26))
++			efuse_a4_offset = -5;
++		else if (efuse_a4_val > 27)
++			efuse_a4_offset = efuse_a4_val - 32;
++		else
++			efuse_a4_offset = efuse_a4_val;
++
++		efuse_a8_val = lan867x_read_efuse_register(phydev, 0x8) & 0x1F;
++		if (efuse_a8_val > 15)
++			efuse_a8_offset = efuse_a8_val - 32;
++		else
++			efuse_a8_offset = efuse_a8_val;
++
++		phydev_info(phydev, "PHY is trimmed\n");
++	} else {
++		efuse_a4_offset = 0;
++		efuse_a8_offset = 0;
++		phydev_warn(phydev, "PHY is not trimmed\n");
++	}
++
++	read_modify_write(phydev, 0x001F00D0, 0xE00C, 0x4000);
++	read_modify_write(phydev, 0x001F0084, 0xFFF0, 0x24E0);
++	read_modify_write(phydev, 0x001F008A, 0xFC00, 0xA000);
++	read_modify_write(phydev, 0x001F00E9, 0x1E00, 0x1E00);
++	read_modify_write(phydev, 0x001F00F5, 0x3000, 0x1000);
++	read_modify_write(phydev, 0x001F0080, 0x0600, 0x0600);
++	read_modify_write(phydev, 0x001F0099, 0x003F, 0x0015);
++	read_modify_write(phydev, 0x001F0098, 0x0FFF, 0x00C3);
++	read_modify_write(phydev, 0x001F00F4, 0x0020, 0x0020);
++	read_modify_write(phydev, 0x001F00F8, 0x2000, 0x0000);
++	read_modify_write(phydev, 0x001F00F9, 0x7C1F, 0x4C13);
++	read_modify_write(phydev, 0x001F00AD, 0x3F3F, 0x0509);
++	read_modify_write(phydev, 0x001F00AE, 0x3F3F, 0x090E);
++	read_modify_write(phydev, 0x001F00AF, 0x3F3F, 0x1116);
++	read_modify_write(phydev, 0x001F00B0, 0x3F3F, 0x0103);
++	read_modify_write(phydev, 0x001F00B1, 0x3F3F, 0x0910);
++	read_modify_write(phydev, 0x001F00B2, 0x3F3F, 0x1D26);
++	read_modify_write(phydev, 0x001F00B3, 0x003F, 0x002A);
++	read_modify_write(phydev, 0x001F00B4, 0x3F3F, 0x0103);
++	read_modify_write(phydev, 0x001F00B5, 0x3F3F, 0x070D);
++	read_modify_write(phydev, 0x001F00B6, 0x3F3F, 0x1720);
++	read_modify_write(phydev, 0x001F00B7, 0x003F, 0x0027);
++	read_modify_write(phydev, 0x001F00B8, 0x3F3F, 0x0509);
++	read_modify_write(phydev, 0x001F00B9, 0x3F3F, 0x0E13);
++	read_modify_write(phydev, 0x001F00BA, 0x3F3F, 0x1C25);
++	read_modify_write(phydev, 0x001F00BB, 0x003F, 0x002B);
++
++	lan867x_write_register_bits(phydev, 0x001F0084, 10, 15, 0x9 + efuse_a4_offset);
++	lan867x_write_register_bits(phydev, 0x001F0084, 4, 9, 0xE + efuse_a4_offset);
++	lan867x_write_register_bits(phydev, 0x001F008A, 10, 15, 0x28 + efuse_a8_offset);
++	lan867x_write_register_bits(phydev, 0x001F00AD, 8, 13, 0x5 + efuse_a4_offset);
++	lan867x_write_register_bits(phydev, 0x001F00AD, 0, 5, 0x9 + efuse_a4_offset);
++	lan867x_write_register_bits(phydev, 0x001F00AE, 8, 13, 0x9 + efuse_a4_offset);
++	lan867x_write_register_bits(phydev, 0x001F00AE, 0, 5, 0xE + efuse_a4_offset);
++	lan867x_write_register_bits(phydev, 0x001F00AF, 8, 13, 0x11 + efuse_a4_offset);
++	lan867x_write_register_bits(phydev, 0x001F00AF, 0, 5, 0x16 + efuse_a4_offset);
++
++	return lan867x_configure_plca(phydev);
++}
++
++static int lan867x_phy_config_intr(struct phy_device *phydev)
++{
++	/* acknowledge reset done interrupt */
++	int int_status = read_reg(phydev, LAN867X_STS2);
++
++	return int_status < 0 ? int_status : 0;
++}
++
++static irqreturn_t lan867x_phy_handle_interrupt(struct phy_device *phydev)
++{
++	int int_status;
++
++	if (phydev->interrupts != PHY_INTERRUPT_ENABLED)
++	{
++		phy_error(phydev);
++		return IRQ_NONE;
++	}
++
++	int_status = read_reg(phydev, LAN867X_STS1);
++	if (int_status < 0)
++	{
++		phy_error(phydev);
++		return IRQ_NONE;
++	}
++	/* TODO: functionality of corresponding interrupt to be implemented */
++
++	int_status = read_reg(phydev, LAN867X_STS2);
++	if (int_status < 0)
++	{
++		phy_error(phydev);
++		return IRQ_NONE;
++	}
++	/* TODO: functionality of corresponding interrupt to be implemented */
++
++	phy_trigger_machine(phydev);
++
++	return IRQ_HANDLED;
++}
++
++static struct phy_driver driver[] = {
++	{
++		PHY_ID_MATCH_EXACT(LAN867X_PHY_ID_REV_B1),
++		.name           	= "Microchip 10BASE-T1S LAN867X Rev.B1 PHY",
++		.soft_reset    		= genphy_soft_reset,
++		.config_init    	= lan867x_rev_b1_config_init,
++		.config_intr		= lan867x_phy_config_intr,
++		.handle_interrupt	= lan867x_phy_handle_interrupt,
++		.config_aneg    	= genphy_config_aneg,
++		.aneg_done      	= genphy_aneg_done,
++		.read_status    	= genphy_read_status,
++		.suspend        	= genphy_suspend,
++		.resume         	= genphy_resume,
++	},
++	{
++		PHY_ID_MATCH_EXACT(LAN867X_PHY_ID_REV_C0),
++		.name           	= "Microchip 10BASE-T1S LAN867X Rev.C0 PHY",
++		.soft_reset     	= genphy_soft_reset,
++		.config_init    	= lan867x_rev_c0_config_init,
++		.config_intr		= lan867x_phy_config_intr,
++		.handle_interrupt	= lan867x_phy_handle_interrupt,
++		.config_aneg    	= genphy_config_aneg,
++		.aneg_done      	= genphy_aneg_done,
++		.read_status    	= genphy_read_status,
++		.suspend        	= genphy_suspend,
++		.resume         	= genphy_resume,
++	},
++};
++
++module_phy_driver(driver);
++
++static struct mdio_device_id __maybe_unused tbl[] = {
++	{ PHY_ID_MATCH_EXACT(LAN867X_PHY_ID_REV_B1) },
++	{ PHY_ID_MATCH_EXACT(LAN867X_PHY_ID_REV_C0) },
++	{ }
++};
++
++MODULE_DEVICE_TABLE(mdio, tbl);
+diff --git a/drivers/net/usb/smsc95xx.c b/drivers/net/usb/smsc95xx.c
+index 4e39e4345084..db8194973580 100644
+--- a/drivers/net/usb/smsc95xx.c
++++ b/drivers/net/usb/smsc95xx.c
+@@ -84,10 +84,9 @@ static int __must_check __smsc95xx_read_reg(struct usbnet *dev, u32 index,
+ 	ret = fn(dev, USB_VENDOR_REQUEST_READ_REGISTER, USB_DIR_IN
+ 		 | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
+ 		 0, index, &buf, 4);
+-	if (ret < 0) {
+-		if (ret != -ENODEV)
+-			netdev_warn(dev->net, "Failed to read reg index 0x%08x: %d\n",
+-				    index, ret);
++	if (unlikely(ret < 0)) {
++		netdev_warn(dev->net, "Failed to read reg index 0x%08x: %d\n",
++			    index, ret);
+ 		return ret;
+ 	}
+ 
+@@ -117,7 +116,7 @@ static int __must_check __smsc95xx_write_reg(struct usbnet *dev, u32 index,
+ 	ret = fn(dev, USB_VENDOR_REQUEST_WRITE_REGISTER, USB_DIR_OUT
+ 		 | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
+ 		 0, index, &buf, 4);
+-	if (ret < 0 && ret != -ENODEV)
++	if (unlikely(ret < 0))
+ 		netdev_warn(dev->net, "Failed to write reg index 0x%08x: %d\n",
+ 			    index, ret);
+ 
+@@ -160,9 +159,6 @@ static int __must_check __smsc95xx_phy_wait_not_busy(struct usbnet *dev,
+ 	do {
+ 		ret = __smsc95xx_read_reg(dev, MII_ADDR, &val, in_pm);
+ 		if (ret < 0) {
+-			/* Ignore -ENODEV error during disconnect() */
+-			if (ret == -ENODEV)
+-				return 0;
+ 			netdev_warn(dev->net, "Error reading MII_ACCESS\n");
+ 			return ret;
+ 		}
+@@ -198,8 +194,7 @@ static int __smsc95xx_mdio_read(struct usbnet *dev, int phy_id, int idx,
+ 	addr = mii_address_cmd(phy_id, idx, MII_READ_ | MII_BUSY_);
+ 	ret = __smsc95xx_write_reg(dev, MII_ADDR, addr, in_pm);
+ 	if (ret < 0) {
+-		if (ret != -ENODEV)
+-			netdev_warn(dev->net, "Error writing MII_ADDR\n");
++		netdev_warn(dev->net, "Error writing MII_ADDR\n");
+ 		goto done;
+ 	}
+ 
+@@ -211,8 +206,7 @@ static int __smsc95xx_mdio_read(struct usbnet *dev, int phy_id, int idx,
+ 
+ 	ret = __smsc95xx_read_reg(dev, MII_DATA, &val, in_pm);
+ 	if (ret < 0) {
+-		if (ret != -ENODEV)
+-			netdev_warn(dev->net, "Error reading MII_DATA\n");
++		netdev_warn(dev->net, "Error reading MII_DATA\n");
+ 		goto done;
+ 	}
+ 
+@@ -220,10 +214,6 @@ static int __smsc95xx_mdio_read(struct usbnet *dev, int phy_id, int idx,
+ 
+ done:
+ 	mutex_unlock(&dev->phy_mutex);
+-
+-	/* Ignore -ENODEV error during disconnect() */
+-	if (ret == -ENODEV)
+-		return 0;
+ 	return ret;
+ }
+ 
+@@ -245,8 +235,7 @@ static void __smsc95xx_mdio_write(struct usbnet *dev, int phy_id,
+ 	val = regval;
+ 	ret = __smsc95xx_write_reg(dev, MII_DATA, val, in_pm);
+ 	if (ret < 0) {
+-		if (ret != -ENODEV)
+-			netdev_warn(dev->net, "Error writing MII_DATA\n");
++		netdev_warn(dev->net, "Error writing MII_DATA\n");
+ 		goto done;
+ 	}
+ 
+@@ -254,8 +243,7 @@ static void __smsc95xx_mdio_write(struct usbnet *dev, int phy_id,
+ 	addr = mii_address_cmd(phy_id, idx, MII_WRITE_ | MII_BUSY_);
+ 	ret = __smsc95xx_write_reg(dev, MII_ADDR, addr, in_pm);
+ 	if (ret < 0) {
+-		if (ret != -ENODEV)
+-			netdev_warn(dev->net, "Error writing MII_ADDR\n");
++		netdev_warn(dev->net, "Error writing MII_ADDR\n");
+ 		goto done;
+ 	}
+ 
+@@ -1056,19 +1044,11 @@ static const struct net_device_ops smsc95xx_netdev_ops = {
+ 	.ndo_get_stats64	= dev_get_tstats64,
+ 	.ndo_set_mac_address 	= eth_mac_addr,
+ 	.ndo_validate_addr	= eth_validate_addr,
+-	.ndo_eth_ioctl		= smsc95xx_ioctl,
++	.ndo_do_ioctl 		= smsc95xx_ioctl,
+ 	.ndo_set_rx_mode	= smsc95xx_set_multicast,
+ 	.ndo_set_features	= smsc95xx_set_features,
+ };
+ 
+-static void smsc95xx_handle_link_change(struct net_device *net)
+-{
+-	struct usbnet *dev = netdev_priv(net);
+-
+-	phy_print_status(net->phydev);
+-	usbnet_defer_kevent(dev, EVENT_LINK_CHANGE);
+-}
+-
+ static int smsc95xx_bind(struct usbnet *dev, struct usb_interface *intf)
+ {
+ 	struct smsc95xx_priv *pdata;
+@@ -1173,17 +1153,6 @@ static int smsc95xx_bind(struct usbnet *dev, struct usb_interface *intf)
+ 	dev->net->min_mtu = ETH_MIN_MTU;
+ 	dev->net->max_mtu = ETH_DATA_LEN;
+ 	dev->hard_mtu = dev->net->mtu + dev->net->hard_header_len;
+-
+-	ret = phy_connect_direct(dev->net, pdata->phydev,
+-				 &smsc95xx_handle_link_change,
+-				 PHY_INTERFACE_MODE_MII);
+-	if (ret) {
+-		netdev_err(dev->net, "can't attach PHY to %s\n", pdata->mdiobus->id);
+-		goto unregister_mdio;
+-	}
+-
+-	phy_attached_info(dev->net->phydev);
+-
+ 	return 0;
+ 
+ unregister_mdio:
+@@ -1201,24 +1170,44 @@ static void smsc95xx_unbind(struct usbnet *dev, struct usb_interface *intf)
+ {
+ 	struct smsc95xx_priv *pdata = dev->driver_priv;
+ 
+-	phy_disconnect(dev->net->phydev);
+ 	mdiobus_unregister(pdata->mdiobus);
+ 	mdiobus_free(pdata->mdiobus);
+ 	netif_dbg(dev, ifdown, dev->net, "free pdata\n");
+ 	kfree(pdata);
+ }
+ 
++static void smsc95xx_handle_link_change(struct net_device *net)
++{
++	phy_print_status(net->phydev);
++}
++
+ static int smsc95xx_start_phy(struct usbnet *dev)
+ {
+-	phy_start(dev->net->phydev);
++	struct smsc95xx_priv *pdata = dev->driver_priv;
++	struct net_device *net = dev->net;
++	int ret;
++
++	ret = smsc95xx_reset(dev);
++	if (ret < 0)
++		return ret;
+ 
++	ret = phy_connect_direct(net, pdata->phydev,
++				 &smsc95xx_handle_link_change,
++				 PHY_INTERFACE_MODE_MII);
++	if (ret) {
++		netdev_err(net, "can't attach PHY to %s\n", pdata->mdiobus->id);
++		return ret;
++	}
++
++	phy_attached_info(net->phydev);
++	phy_start(net->phydev);
+ 	return 0;
+ }
+ 
+-static int smsc95xx_stop(struct usbnet *dev)
++static int smsc95xx_disconnect_phy(struct usbnet *dev)
+ {
+ 	phy_stop(dev->net->phydev);
+-
++	phy_disconnect(dev->net->phydev);
+ 	return 0;
+ }
+ 
+@@ -1972,9 +1961,8 @@ static const struct driver_info smsc95xx_info = {
+ 	.bind		= smsc95xx_bind,
+ 	.unbind		= smsc95xx_unbind,
+ 	.link_reset	= smsc95xx_link_reset,
+-	.reset		= smsc95xx_reset,
+-	.check_connect	= smsc95xx_start_phy,
+-	.stop		= smsc95xx_stop,
++	.reset		= smsc95xx_start_phy,
++	.stop		= smsc95xx_disconnect_phy,
+ 	.rx_fixup	= smsc95xx_rx_fixup,
+ 	.tx_fixup	= smsc95xx_tx_fixup,
+ 	.status		= smsc95xx_status,
+@@ -2073,12 +2061,17 @@ static const struct usb_device_id products[] = {
+ 		USB_DEVICE(0x0424, 0x9E08),
+ 		.driver_info = (unsigned long) &smsc95xx_info,
+ 	},
++	{
++		/* 10BASE-T1S USB Network Adapter */
++		USB_DEVICE(0x184F, 0x0051),
++		.driver_info = (unsigned long)&smsc95xx_info,
++	},
+ 	{ },		/* END */
+ };
+ MODULE_DEVICE_TABLE(usb, products);
+ 
+ static struct usb_driver smsc95xx_driver = {
+-	.name		= "smsc95xx",
++	.name		= "smsc95xx_t1s",
+ 	.id_table	= products,
+ 	.probe		= usbnet_probe,
+ 	.suspend	= smsc95xx_suspend,

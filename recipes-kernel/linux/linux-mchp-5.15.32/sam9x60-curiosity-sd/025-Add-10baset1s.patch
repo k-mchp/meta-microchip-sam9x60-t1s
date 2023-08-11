@@ -1,0 +1,732 @@
+diff --git a/drivers/net/usb/Kconfig b/drivers/net/usb/Kconfig
+old mode 100644
+new mode 100755
+index b554054a7560..6c3b2cb133bf
+--- a/drivers/net/usb/Kconfig
++++ b/drivers/net/usb/Kconfig
+@@ -130,6 +130,18 @@ config USB_LAN78XX
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called lan78xx.
+ 
++config USB_LAN867X
++	tristate "Microchip LAN867X Based USB Ethernet Adapters"
++	depends on USB_USBNET
++	select PHYLIB
++	select SMSC_PHY
++	select BITREVERSE
++	select CRC16
++	select CRC32
++	help
++	  This option adds support for Microchip LAN867X based USB 2.0
++	  10/100 Ethernet adapters.
++
+ config USB_USBNET
+ 	tristate "Multi-purpose USB Networking Framework"
+ 	select MII
+diff --git a/drivers/net/usb/Makefile b/drivers/net/usb/Makefile
+old mode 100644
+new mode 100755
+index 4964f7b326fb..76f193535746
+--- a/drivers/net/usb/Makefile
++++ b/drivers/net/usb/Makefile
+@@ -10,6 +10,7 @@ obj-$(CONFIG_USB_RTL8150)	+= rtl8150.o
+ obj-$(CONFIG_USB_RTL8152)	+= r8152.o
+ obj-$(CONFIG_USB_HSO)		+= hso.o
+ obj-$(CONFIG_USB_LAN78XX)	+= lan78xx.o
++obj-$(CONFIG_USB_LAN867X)	+= lan867x_phy.o
+ obj-$(CONFIG_USB_NET_AX8817X)	+= asix.o
+ asix-y := asix_devices.o asix_common.o ax88172a.o
+ obj-$(CONFIG_USB_NET_AX88179_178A)      += ax88179_178a.o
+@@ -19,7 +20,7 @@ obj-$(CONFIG_USB_NET_DM9601)	+= dm9601.o
+ obj-$(CONFIG_USB_NET_SR9700)	+= sr9700.o
+ obj-$(CONFIG_USB_NET_SR9800)	+= sr9800.o
+ obj-$(CONFIG_USB_NET_SMSC75XX)	+= smsc75xx.o
+-obj-$(CONFIG_USB_NET_SMSC95XX)	+= smsc95xx.o
++obj-$(CONFIG_USB_NET_SMSC95XX)	+= smsc95xx_t1s.o
+ obj-$(CONFIG_USB_NET_GL620A)	+= gl620a.o
+ obj-$(CONFIG_USB_NET_NET1080)	+= net1080.o
+ obj-$(CONFIG_USB_NET_PLUSB)	+= plusb.o
+@@ -41,4 +42,3 @@ obj-$(CONFIG_USB_NET_QMI_WWAN)	+= qmi_wwan.o
+ obj-$(CONFIG_USB_NET_CDC_MBIM)	+= cdc_mbim.o
+ obj-$(CONFIG_USB_NET_CH9200)	+= ch9200.o
+ obj-$(CONFIG_USB_NET_AQC111)	+= aqc111.o
+-obj-$(CONFIG_USB_RTL8153_ECM)	+= r8153_ecm.o
+diff --git a/drivers/net/usb/lan867x_phy.c b/drivers/net/usb/lan867x_phy.c
+new file mode 100755
+index 000000000000..bdb19cca179a
+--- /dev/null
++++ b/drivers/net/usb/lan867x_phy.c
+@@ -0,0 +1,245 @@
++/*
++ * drivers/net/phy/lan867x_phy.c
++ *
++ * Driver for Microchip 10BASE-T1S LAN867X PHY
++ *
++ * Author: Parthiban Veerasooran
++ * Author: Jan Huber
++ *
++ * Copyright (c) 2018 Microchip Technology Inc.
++ *
++ * This program is free software; you can redistribute  it and/or modify it
++ * under  the terms of  the GNU General  Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/phy.h>
++#include <linux/firmware.h>
++#include <linux/delay.h>
++
++static const struct firmware *fw_p;
++
++MODULE_DESCRIPTION("Microchip 10BASE-T1S lan867x Phy driver");
++MODULE_AUTHOR("Parthiban Veerasooran <Parthiban.Veerasooran@microchip.com>");
++MODULE_AUTHOR("Jan Huber <Jan.Huber@microchip.com>");
++MODULE_LICENSE("GPL");
++MODULE_VERSION("0.5");
++
++static int mk_u32(const u8 *ptr, u32 *value)
++{
++	*value = ptr[0] << 24 | ptr[1] << 16 | ptr[2] << 8 | ptr[3];
++	return 4;
++}
++
++static int mk_u16(const u8 *ptr, u16 *value)
++{
++	*value = ptr[0] << 8 | ptr[1];
++	return 2;
++}
++
++static void write_reg(struct phy_device *phydev, u32 addr, u16 val)
++{
++	if (addr > 0xFF)
++		phy_write_mmd(phydev, addr >> 16, addr & 0xFFFF, val);
++	else
++		phy_write(phydev, addr, val);
++}
++
++static int read_reg(struct phy_device *phydev, u32 addr)
++{
++	if (addr > 0xFF)
++		return phy_read_mmd(phydev, addr >> 16, addr & 0xFFFF);
++
++	return phy_read(phydev, addr);
++}
++
++enum { LAN867X_CFG_TYPE = 1 };
++
++static const int opcode_lengts[] = { 6, 8, 10, 10, 2, 12, 12 };
++
++static bool configure_lan867x(struct phy_device *phydev, const u8 *ptr,
++			     const u8 *end);
++
++static int config_init(struct phy_device *phydev)
++{
++	const u8 *ptr;
++	const u8 *end;
++	u32 type, length, offset;
++	int ret = request_firmware_direct(&fw_p, "lan867x_config.bin", NULL);
++
++	if (ret)
++		return ret;
++
++	phydev->speed = SPEED_10;
++	phydev->autoneg = DUPLEX_HALF;
++
++	ptr = fw_p->data;
++	end = fw_p->data + fw_p->size;
++
++	while (ptr < end) {
++		offset = ptr - fw_p->data;
++		if (ptr + 8 > end) {
++			pr_err("bad TLV format, config offset: %d\n", offset);
++			goto err;
++		}
++		ptr += mk_u32(ptr, &type);
++		ptr += mk_u32(ptr, &length);
++		if (ptr + length > end) {
++			pr_err("bad TLV length, config offset: %d\n", offset);
++			goto err;
++		}
++		if (type == LAN867X_CFG_TYPE) {
++			if (!configure_lan867x(phydev, ptr, ptr + length))
++				goto err;
++		}
++		ptr += length;
++	}
++
++	release_firmware(fw_p);
++	return 0;
++
++err:
++	release_firmware(fw_p);
++	return -EFAULT;
++}
++
++static bool configure_lan867x(struct phy_device *phydev, const u8 *ptr,
++			     const u8 *end)
++{
++	u32 addr;
++	u16 mask, value, skip, reg, count, delay;
++
++	while (ptr < end) {
++		u8 op = *ptr++;
++
++		if (op >= ARRAY_SIZE(opcode_lengts)) {
++			pr_err("bad opcode: %u\n", op);
++			goto err;
++		}
++
++		if (ptr + opcode_lengts[op] > end) {
++			pr_err("bad script format\n");
++			goto err;
++		}
++
++		switch (op) {
++		case 0:
++			ptr += mk_u32(ptr, &addr);
++			ptr += mk_u16(ptr, &value);
++			write_reg(phydev, addr, value);
++			break;
++		case 1:
++			ptr += mk_u32(ptr, &addr);
++			ptr += mk_u16(ptr, &mask);
++			ptr += mk_u16(ptr, &value);
++			reg = read_reg(phydev, addr) & ~mask;
++			write_reg(phydev, addr, reg | value);
++			break;
++		case 2:
++			ptr += mk_u32(ptr, &addr);
++			ptr += mk_u16(ptr, &mask);
++			ptr += mk_u16(ptr, &value);
++			ptr += mk_u16(ptr, &skip);
++			reg = read_reg(phydev, addr) & mask;
++			if (reg == value)
++				break;
++
++			if (!skip) {
++				pr_err("value (*%08x & %04x) == %04x is expected to be %04x\n",
++				       addr, mask, reg, value);
++				goto err;
++			}
++			ptr += skip;
++			break;
++		case 3:
++			ptr += mk_u32(ptr, &addr);
++			ptr += mk_u16(ptr, &mask);
++			ptr += mk_u16(ptr, &value);
++			ptr += mk_u16(ptr, &skip);
++			reg = read_reg(phydev, addr) & mask;
++			if (reg != value)
++				break;
++
++			if (!skip) {
++				pr_err("value (*%08x & %04x) is not expected to be %04x\n",
++				       addr, mask, reg);
++				goto err;
++			}
++			ptr += skip;
++			break;
++		case 4:
++			ptr += mk_u16(ptr, &skip);
++			ptr += skip;
++			break;
++		case 5:
++			ptr += mk_u32(ptr, &addr);
++			ptr += mk_u16(ptr, &mask);
++			ptr += mk_u16(ptr, &value);
++			ptr += mk_u16(ptr, &count);
++			ptr += mk_u16(ptr, &delay);
++			while ((reg = read_reg(phydev, addr) & mask) != value) {
++				if (!count) {
++					pr_err("value (*%08x & %04x) == %04x is expected to be %04x\n",
++					       addr, mask, reg, value);
++					goto err;
++				}
++				mdelay(delay);
++				count--;
++			}
++			break;
++		case 6:
++			ptr += mk_u32(ptr, &addr);
++			ptr += mk_u16(ptr, &mask);
++			ptr += mk_u16(ptr, &value);
++			ptr += mk_u16(ptr, &count);
++			ptr += mk_u16(ptr, &delay);
++			while ((reg = read_reg(phydev, addr) & mask) == value) {
++				if (!count) {
++					pr_err("value (*%08x & %04x) is not expected to be %04x\n",
++					       addr, mask, reg);
++					goto err;
++				}
++				mdelay(delay);
++				count--;
++			}
++			break;
++		}
++
++		if (ptr > end) {
++			pr_err("bad script format\n");
++			goto err;
++		}
++	}
++
++	return true;
++
++err:
++	return false;
++}
++
++static struct phy_driver driver[] = {
++	{
++		.phy_id         = 0x0007C160,
++		.name           = "Microchip 10BASE-T1S LAN867X PHY",
++		.phy_id_mask    = 0x0ffffff0,
++		.soft_reset     = genphy_soft_reset,
++		.config_init    = config_init,
++		.config_aneg    = genphy_config_aneg,
++		.aneg_done      = genphy_aneg_done,
++		.read_status    = genphy_read_status,
++		.suspend        = genphy_suspend,
++		.resume         = genphy_resume,
++	}
++};
++
++module_phy_driver(driver);
++
++static struct mdio_device_id __maybe_unused tbl[] = {
++	{ 0x0007C160, 0x0ffffff0 },
++	{ }
++};
++
++MODULE_DEVICE_TABLE(mdio, tbl);
+diff --git a/drivers/net/usb/smsc95xx.c b/drivers/net/usb/smsc95xx.c
+index 4e39e4345084..9b7c9894c8fd 100644
+--- a/drivers/net/usb/smsc95xx.c
++++ b/drivers/net/usb/smsc95xx.c
+@@ -18,6 +18,8 @@
+ #include <linux/usb/usbnet.h>
+ #include <linux/slab.h>
+ #include <linux/of_net.h>
++#include <linux/irq.h>
++#include <linux/irqdomain.h>
+ #include <linux/mdio.h>
+ #include <linux/phy.h>
+ #include "smsc95xx.h"
+@@ -51,6 +53,9 @@
+ #define SUSPEND_ALLMODES		(SUSPEND_SUSPEND0 | SUSPEND_SUSPEND1 | \
+ 					 SUSPEND_SUSPEND2 | SUSPEND_SUSPEND3)
+ 
++#define SMSC95XX_NR_IRQS		(1) /* raise to 12 for GPIOs */
++#define PHY_HWIRQ			(SMSC95XX_NR_IRQS - 1)
++
+ struct smsc95xx_priv {
+ 	u32 mac_cr;
+ 	u32 hash_hi;
+@@ -59,8 +64,12 @@ struct smsc95xx_priv {
+ 	spinlock_t mac_cr_lock;
+ 	u8 features;
+ 	u8 suspend_flags;
++	struct irq_chip irqchip;
++	struct irq_domain *irqdomain;
++	struct fwnode_handle *irqfwnode;
+ 	struct mii_bus *mdiobus;
+ 	struct phy_device *phydev;
++	struct task_struct *pm_task;
+ };
+ 
+ static bool turbo_mode = true;
+@@ -70,13 +79,14 @@ MODULE_PARM_DESC(turbo_mode, "Enable multiple frames per Rx transaction");
+ static int __must_check __smsc95xx_read_reg(struct usbnet *dev, u32 index,
+ 					    u32 *data, int in_pm)
+ {
++	struct smsc95xx_priv *pdata = dev->driver_priv;
+ 	u32 buf;
+ 	int ret;
+ 	int (*fn)(struct usbnet *, u8, u8, u16, u16, void *, u16);
+ 
+ 	BUG_ON(!dev);
+ 
+-	if (!in_pm)
++	if (current != pdata->pm_task)
+ 		fn = usbnet_read_cmd;
+ 	else
+ 		fn = usbnet_read_cmd_nopm;
+@@ -100,13 +110,14 @@ static int __must_check __smsc95xx_read_reg(struct usbnet *dev, u32 index,
+ static int __must_check __smsc95xx_write_reg(struct usbnet *dev, u32 index,
+ 					     u32 data, int in_pm)
+ {
++	struct smsc95xx_priv *pdata = dev->driver_priv;
+ 	u32 buf;
+ 	int ret;
+ 	int (*fn)(struct usbnet *, u8, u8, u16, u16, const void *, u16);
+ 
+ 	BUG_ON(!dev);
+ 
+-	if (!in_pm)
++	if (current != pdata->pm_task)
+ 		fn = usbnet_write_cmd;
+ 	else
+ 		fn = usbnet_write_cmd_nopm;
+@@ -564,16 +575,12 @@ static int smsc95xx_phy_update_flowcontrol(struct usbnet *dev)
+ 	return smsc95xx_write_reg(dev, AFC_CFG, afc_cfg);
+ }
+ 
+-static int smsc95xx_link_reset(struct usbnet *dev)
++static void smsc95xx_mac_update_fullduplex(struct usbnet *dev)
+ {
+ 	struct smsc95xx_priv *pdata = dev->driver_priv;
+ 	unsigned long flags;
+ 	int ret;
+ 
+-	ret = smsc95xx_write_reg(dev, INT_STS, INT_STS_CLEAR_ALL_);
+-	if (ret < 0)
+-		return ret;
+-
+ 	spin_lock_irqsave(&pdata->mac_cr_lock, flags);
+ 	if (pdata->phydev->duplex != DUPLEX_FULL) {
+ 		pdata->mac_cr &= ~MAC_CR_FDPX_;
+@@ -585,18 +592,22 @@ static int smsc95xx_link_reset(struct usbnet *dev)
+ 	spin_unlock_irqrestore(&pdata->mac_cr_lock, flags);
+ 
+ 	ret = smsc95xx_write_reg(dev, MAC_CR, pdata->mac_cr);
+-	if (ret < 0)
+-		return ret;
++	if (ret < 0) {
++		if (ret != -ENODEV)
++			netdev_warn(dev->net,
++				    "Error updating MAC full duplex mode\n");
++		return;
++	}
+ 
+ 	ret = smsc95xx_phy_update_flowcontrol(dev);
+ 	if (ret < 0)
+ 		netdev_warn(dev->net, "Error updating PHY flow control\n");
+-
+-	return ret;
+ }
+ 
+ static void smsc95xx_status(struct usbnet *dev, struct urb *urb)
+ {
++	struct smsc95xx_priv *pdata = dev->driver_priv;
++	unsigned long flags;
+ 	u32 intdata;
+ 
+ 	if (urb->actual_length != 4) {
+@@ -608,11 +619,15 @@ static void smsc95xx_status(struct usbnet *dev, struct urb *urb)
+ 	intdata = get_unaligned_le32(urb->transfer_buffer);
+ 	netif_dbg(dev, link, dev->net, "intdata: 0x%08X\n", intdata);
+ 
++	local_irq_save(flags);
++
+ 	if (intdata & INT_ENP_PHY_INT_)
+-		usbnet_defer_kevent(dev, EVENT_LINK_RESET);
++		generic_handle_domain_irq(pdata->irqdomain, PHY_HWIRQ);
+ 	else
+ 		netdev_warn(dev->net, "unexpected interrupt, intdata=0x%08X\n",
+ 			    intdata);
++
++	local_irq_restore(flags);
+ }
+ 
+ /* Enable or disable Tx & Rx checksum offload engines */
+@@ -865,24 +880,6 @@ static int smsc95xx_reset(struct usbnet *dev)
+ 		return ret;
+ 	}
+ 
+-	ret = smsc95xx_write_reg(dev, PM_CTRL, PM_CTL_PHY_RST_);
+-	if (ret < 0)
+-		return ret;
+-
+-	timeout = 0;
+-	do {
+-		msleep(10);
+-		ret = smsc95xx_read_reg(dev, PM_CTRL, &read_buf);
+-		if (ret < 0)
+-			return ret;
+-		timeout++;
+-	} while ((read_buf & PM_CTL_PHY_RST_) && (timeout < 100));
+-
+-	if (timeout >= 100) {
+-		netdev_warn(dev->net, "timeout waiting for PHY Reset\n");
+-		return ret;
+-	}
+-
+ 	ret = smsc95xx_set_mac_address(dev);
+ 	if (ret < 0)
+ 		return ret;
+@@ -1066,6 +1063,7 @@ static void smsc95xx_handle_link_change(struct net_device *net)
+ 	struct usbnet *dev = netdev_priv(net);
+ 
+ 	phy_print_status(net->phydev);
++	smsc95xx_mac_update_fullduplex(dev);
+ 	usbnet_defer_kevent(dev, EVENT_LINK_CHANGE);
+ }
+ 
+@@ -1073,8 +1071,9 @@ static int smsc95xx_bind(struct usbnet *dev, struct usb_interface *intf)
+ {
+ 	struct smsc95xx_priv *pdata;
+ 	bool is_internal_phy;
++	char usb_path[64];
++	int ret, phy_irq;
+ 	u32 val;
+-	int ret;
+ 
+ 	printk(KERN_INFO SMSC_CHIPNAME " v" SMSC_DRIVER_VERSION "\n");
+ 
+@@ -1114,10 +1113,38 @@ static int smsc95xx_bind(struct usbnet *dev, struct usb_interface *intf)
+ 	if (ret)
+ 		goto free_pdata;
+ 
++	/* create irq domain for use by PHY driver and GPIO consumers */
++	usb_make_path(dev->udev, usb_path, sizeof(usb_path));
++	pdata->irqfwnode = irq_domain_alloc_named_fwnode(usb_path);
++	if (!pdata->irqfwnode) {
++		ret = -ENOMEM;
++		goto free_pdata;
++	}
++
++	pdata->irqdomain = irq_domain_create_linear(pdata->irqfwnode,
++						    SMSC95XX_NR_IRQS,
++						    &irq_domain_simple_ops,
++						    pdata);
++	if (!pdata->irqdomain) {
++		ret = -ENOMEM;
++		goto free_irqfwnode;
++	}
++
++	phy_irq = irq_create_mapping(pdata->irqdomain, PHY_HWIRQ);
++	if (!phy_irq) {
++		ret = -ENOENT;
++		goto remove_irqdomain;
++	}
++
++	pdata->irqchip = dummy_irq_chip;
++	pdata->irqchip.name = SMSC_CHIPNAME;
++	irq_set_chip_and_handler_name(phy_irq, &pdata->irqchip,
++				      handle_simple_irq, "phy");
++
+ 	pdata->mdiobus = mdiobus_alloc();
+ 	if (!pdata->mdiobus) {
+ 		ret = -ENOMEM;
+-		goto free_pdata;
++		goto dispose_irq;
+ 	}
+ 
+ 	ret = smsc95xx_read_reg(dev, HW_CFG, &val);
+@@ -1150,6 +1177,7 @@ static int smsc95xx_bind(struct usbnet *dev, struct usb_interface *intf)
+ 		goto unregister_mdio;
+ 	}
+ 
++	pdata->phydev->irq = phy_irq;
+ 	pdata->phydev->is_internal = is_internal_phy;
+ 
+ 	/* detect device revision as different features may be available */
+@@ -1192,6 +1220,15 @@ static int smsc95xx_bind(struct usbnet *dev, struct usb_interface *intf)
+ free_mdio:
+ 	mdiobus_free(pdata->mdiobus);
+ 
++dispose_irq:
++	irq_dispose_mapping(phy_irq);
++
++remove_irqdomain:
++	irq_domain_remove(pdata->irqdomain);
++
++free_irqfwnode:
++	irq_domain_free_fwnode(pdata->irqfwnode);
++
+ free_pdata:
+ 	kfree(pdata);
+ 	return ret;
+@@ -1204,6 +1241,9 @@ static void smsc95xx_unbind(struct usbnet *dev, struct usb_interface *intf)
+ 	phy_disconnect(dev->net->phydev);
+ 	mdiobus_unregister(pdata->mdiobus);
+ 	mdiobus_free(pdata->mdiobus);
++	irq_dispose_mapping(irq_find_mapping(pdata->irqdomain, PHY_HWIRQ));
++	irq_domain_remove(pdata->irqdomain);
++	irq_domain_free_fwnode(pdata->irqfwnode);
+ 	netif_dbg(dev, ifdown, dev->net, "free pdata\n");
+ 	kfree(pdata);
+ }
+@@ -1228,29 +1268,6 @@ static u32 smsc_crc(const u8 *buffer, size_t len, int filter)
+ 	return crc << ((filter % 2) * 16);
+ }
+ 
+-static int smsc95xx_enable_phy_wakeup_interrupts(struct usbnet *dev, u16 mask)
+-{
+-	int ret;
+-
+-	netdev_dbg(dev->net, "enabling PHY wakeup interrupts\n");
+-
+-	/* read to clear */
+-	ret = smsc95xx_mdio_read_nopm(dev, PHY_INT_SRC);
+-	if (ret < 0)
+-		return ret;
+-
+-	/* enable interrupt source */
+-	ret = smsc95xx_mdio_read_nopm(dev, PHY_INT_MASK);
+-	if (ret < 0)
+-		return ret;
+-
+-	ret |= mask;
+-
+-	smsc95xx_mdio_write_nopm(dev, PHY_INT_MASK, ret);
+-
+-	return 0;
+-}
+-
+ static int smsc95xx_link_ok_nopm(struct usbnet *dev)
+ {
+ 	int ret;
+@@ -1417,7 +1434,6 @@ static int smsc95xx_enter_suspend3(struct usbnet *dev)
+ static int smsc95xx_autosuspend(struct usbnet *dev, u32 link_up)
+ {
+ 	struct smsc95xx_priv *pdata = dev->driver_priv;
+-	int ret;
+ 
+ 	if (!netif_running(dev->net)) {
+ 		/* interface is ifconfig down so fully power down hw */
+@@ -1436,27 +1452,10 @@ static int smsc95xx_autosuspend(struct usbnet *dev, u32 link_up)
+ 		}
+ 
+ 		netdev_dbg(dev->net, "autosuspend entering SUSPEND1\n");
+-
+-		/* enable PHY wakeup events for if cable is attached */
+-		ret = smsc95xx_enable_phy_wakeup_interrupts(dev,
+-			PHY_INT_MASK_ANEG_COMP_);
+-		if (ret < 0) {
+-			netdev_warn(dev->net, "error enabling PHY wakeup ints\n");
+-			return ret;
+-		}
+-
+ 		netdev_info(dev->net, "entering SUSPEND1 mode\n");
+ 		return smsc95xx_enter_suspend1(dev);
+ 	}
+ 
+-	/* enable PHY wakeup events so we remote wakeup if cable is pulled */
+-	ret = smsc95xx_enable_phy_wakeup_interrupts(dev,
+-		PHY_INT_MASK_LINK_DOWN_);
+-	if (ret < 0) {
+-		netdev_warn(dev->net, "error enabling PHY wakeup ints\n");
+-		return ret;
+-	}
+-
+ 	netdev_dbg(dev->net, "autosuspend entering SUSPEND3\n");
+ 	return smsc95xx_enter_suspend3(dev);
+ }
+@@ -1468,9 +1467,12 @@ static int smsc95xx_suspend(struct usb_interface *intf, pm_message_t message)
+ 	u32 val, link_up;
+ 	int ret;
+ 
++	pdata->pm_task = current;
++
+ 	ret = usbnet_suspend(intf, message);
+ 	if (ret < 0) {
+ 		netdev_warn(dev->net, "usbnet_suspend error\n");
++		pdata->pm_task = NULL;
+ 		return ret;
+ 	}
+ 
+@@ -1522,13 +1524,6 @@ static int smsc95xx_suspend(struct usb_interface *intf, pm_message_t message)
+ 	}
+ 
+ 	if (pdata->wolopts & WAKE_PHY) {
+-		ret = smsc95xx_enable_phy_wakeup_interrupts(dev,
+-			(PHY_INT_MASK_ANEG_COMP_ | PHY_INT_MASK_LINK_DOWN_));
+-		if (ret < 0) {
+-			netdev_warn(dev->net, "error enabling PHY wakeup ints\n");
+-			goto done;
+-		}
+-
+ 		/* if link is down then configure EDPD and enter SUSPEND1,
+ 		 * otherwise enter SUSPEND0 below
+ 		 */
+@@ -1717,6 +1712,7 @@ static int smsc95xx_suspend(struct usb_interface *intf, pm_message_t message)
+ 	if (ret && PMSG_IS_AUTO(message))
+ 		usbnet_resume(intf);
+ 
++	pdata->pm_task = NULL;
+ 	return ret;
+ }
+ 
+@@ -1737,45 +1733,53 @@ static int smsc95xx_resume(struct usb_interface *intf)
+ 	/* do this first to ensure it's cleared even in error case */
+ 	pdata->suspend_flags = 0;
+ 
++	pdata->pm_task = current;
++
+ 	if (suspend_flags & SUSPEND_ALLMODES) {
+ 		/* clear wake-up sources */
+ 		ret = smsc95xx_read_reg_nopm(dev, WUCSR, &val);
+ 		if (ret < 0)
+-			return ret;
++			goto done;
+ 
+ 		val &= ~(WUCSR_WAKE_EN_ | WUCSR_MPEN_);
+ 
+ 		ret = smsc95xx_write_reg_nopm(dev, WUCSR, val);
+ 		if (ret < 0)
+-			return ret;
++			goto done;
+ 
+ 		/* clear wake-up status */
+ 		ret = smsc95xx_read_reg_nopm(dev, PM_CTRL, &val);
+ 		if (ret < 0)
+-			return ret;
++			goto done;
+ 
+ 		val &= ~PM_CTL_WOL_EN_;
+ 		val |= PM_CTL_WUPS_;
+ 
+ 		ret = smsc95xx_write_reg_nopm(dev, PM_CTRL, val);
+ 		if (ret < 0)
+-			return ret;
++			goto done;
+ 	}
+ 
++	phy_init_hw(pdata->phydev);
++
+ 	ret = usbnet_resume(intf);
+ 	if (ret < 0)
+ 		netdev_warn(dev->net, "usbnet_resume error\n");
+ 
+-	phy_init_hw(pdata->phydev);
++done:
++	pdata->pm_task = NULL;
+ 	return ret;
+ }
+ 
+ static int smsc95xx_reset_resume(struct usb_interface *intf)
+ {
+ 	struct usbnet *dev = usb_get_intfdata(intf);
++	struct smsc95xx_priv *pdata = dev->driver_priv;
+ 	int ret;
+ 
++	pdata->pm_task = current;
+ 	ret = smsc95xx_reset(dev);
++	pdata->pm_task = NULL;
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -1971,7 +1975,6 @@ static const struct driver_info smsc95xx_info = {
+ 	.description	= "smsc95xx USB 2.0 Ethernet",
+ 	.bind		= smsc95xx_bind,
+ 	.unbind		= smsc95xx_unbind,
+-	.link_reset	= smsc95xx_link_reset,
+ 	.reset		= smsc95xx_reset,
+ 	.check_connect	= smsc95xx_start_phy,
+ 	.stop		= smsc95xx_stop,
+@@ -2073,6 +2076,11 @@ static const struct usb_device_id products[] = {
+ 		USB_DEVICE(0x0424, 0x9E08),
+ 		.driver_info = (unsigned long) &smsc95xx_info,
+ 	},
++	{
++		/* 10BASE-T1S USB Network Adapter */
++		USB_DEVICE(0x184F, 0x0051),
++		.driver_info = (unsigned long)&smsc95xx_info,
++	},
+ 	{ },		/* END */
+ };
+ MODULE_DEVICE_TABLE(usb, products);
