@@ -2,7 +2,7 @@ SUMMARY = "Microchip SAM9X60 t1s Image"
 
 LICENSE = "MIT"
 
-IMAGE_FEATURES += "ssh-server-openssh package-management"
+IMAGE_FEATURES:append = " ssh-server-openssh package-management"
 
 IMAGE_INSTALL = "\
     packagegroup-core-boot \
@@ -59,7 +59,6 @@ IMAGE_INSTALL = "\
     usbutils \
     wget \
     hostapd \
-    9bit \
     rng-tools \
     bluez5 \
     wireless-regdb-static \
@@ -68,18 +67,16 @@ IMAGE_INSTALL = "\
     nftables \
     phytool \
     tcpdump \
-    dhcp-server \
-    dhcp-server-config \
+    kea \
     ${CORE_IMAGE_EXTRA_INSTALL} \
-    "
+"
 
-IMAGE_INSTALL_append_sam9x60-curiosity += " \
-		ca-certificates \
-		connman \
-		connman-client \
-		iptables \
-		kernel-modules \
-	"
+IMAGE_INSTALL:append:sam9x60-curiosity = " \
+    ca-certificates \
+    connman \
+    connman-client \
+    iptables \
+    kernel-modules \
+"
 
 inherit core-image
-
