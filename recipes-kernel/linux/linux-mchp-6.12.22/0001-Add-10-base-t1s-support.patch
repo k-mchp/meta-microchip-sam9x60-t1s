@@ -1,8 +1,24 @@
+From 635b3b47687de4cebc4a880cafbb1c94d28023d3 Mon Sep 17 00:00:00 2001
+From: Matt Wood <matt.wood@microchip.com>
+Date: Thu, 14 Aug 2025 14:27:33 -0400
+Subject: [PATCH] Add 10-base-t1s support
+
+Add 10-base-t1s support for LAN867x and SMSC95xx
+
+Signed-off-by: Matt Wood <matt.wood@microchip.com>
+---
+ drivers/net/usb/Kconfig       |  12 +
+ drivers/net/usb/Makefile      |   1 +
+ drivers/net/usb/lan867x_phy.c | 428 ++++++++++++++++++++++++++++++++++
+ drivers/net/usb/smsc95xx.c    |  89 ++++---
+ 4 files changed, 483 insertions(+), 47 deletions(-)
+ create mode 100644 drivers/net/usb/lan867x_phy.c
+
 diff --git a/drivers/net/usb/Kconfig b/drivers/net/usb/Kconfig
-index b554054a7560..6c3b2cb133bf 100644
+index 3c360d4f0635..8cda52a52d18 100644
 --- a/drivers/net/usb/Kconfig
 +++ b/drivers/net/usb/Kconfig
-@@ -130,6 +130,18 @@ config USB_LAN78XX
+@@ -131,6 +131,18 @@ config USB_LAN78XX
  	  To compile this driver as a module, choose M here: the
  	  module will be called lan78xx.
  
@@ -22,7 +38,7 @@ index b554054a7560..6c3b2cb133bf 100644
  	tristate "Multi-purpose USB Networking Framework"
  	select MII
 diff --git a/drivers/net/usb/Makefile b/drivers/net/usb/Makefile
-index 4964f7b326fb..c93619b6ec48 100644
+index 4964f7b326fb..695e56f1cb3e 100644
 --- a/drivers/net/usb/Makefile
 +++ b/drivers/net/usb/Makefile
 @@ -10,6 +10,7 @@ obj-$(CONFIG_USB_RTL8150)	+= rtl8150.o
@@ -33,11 +49,6 @@ index 4964f7b326fb..c93619b6ec48 100644
  obj-$(CONFIG_USB_NET_AX8817X)	+= asix.o
  asix-y := asix_devices.o asix_common.o ax88172a.o
  obj-$(CONFIG_USB_NET_AX88179_178A)      += ax88179_178a.o
-@@ -41,4 +42,3 @@ obj-$(CONFIG_USB_NET_QMI_WWAN)	+= qmi_wwan.o
- obj-$(CONFIG_USB_NET_CDC_MBIM)	+= cdc_mbim.o
- obj-$(CONFIG_USB_NET_CH9200)	+= ch9200.o
- obj-$(CONFIG_USB_NET_AQC111)	+= aqc111.o
--obj-$(CONFIG_USB_RTL8153_ECM)	+= r8153_ecm.o
 diff --git a/drivers/net/usb/lan867x_phy.c b/drivers/net/usb/lan867x_phy.c
 new file mode 100644
 index 000000000000..d6a0090573d4
@@ -473,14 +484,16 @@ index 000000000000..d6a0090573d4
 +
 +MODULE_DEVICE_TABLE(mdio, tbl);
 diff --git a/drivers/net/usb/smsc95xx.c b/drivers/net/usb/smsc95xx.c
-index 4e39e4345084..db8194973580 100644
+index 8e82184be5e7..207b472cb5b9 100644
 --- a/drivers/net/usb/smsc95xx.c
 +++ b/drivers/net/usb/smsc95xx.c
-@@ -84,10 +84,9 @@ static int __must_check __smsc95xx_read_reg(struct usbnet *dev, u32 index,
+@@ -95,12 +95,10 @@ static int __must_check smsc95xx_read_reg(struct usbnet *dev, u32 index,
  	ret = fn(dev, USB_VENDOR_REQUEST_READ_REGISTER, USB_DIR_IN
  		 | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
  		 0, index, &buf, 4);
--	if (ret < 0) {
+-	if (ret < 4) {
+-		ret = ret < 0 ? ret : -ENODATA;
+ 
 -		if (ret != -ENODEV)
 -			netdev_warn(dev->net, "Failed to read reg index 0x%08x: %d\n",
 -				    index, ret);
@@ -490,7 +503,7 @@ index 4e39e4345084..db8194973580 100644
  		return ret;
  	}
  
-@@ -117,7 +116,7 @@ static int __must_check __smsc95xx_write_reg(struct usbnet *dev, u32 index,
+@@ -129,7 +127,7 @@ static int __must_check smsc95xx_write_reg(struct usbnet *dev, u32 index,
  	ret = fn(dev, USB_VENDOR_REQUEST_WRITE_REGISTER, USB_DIR_OUT
  		 | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
  		 0, index, &buf, 4);
@@ -499,9 +512,9 @@ index 4e39e4345084..db8194973580 100644
  		netdev_warn(dev->net, "Failed to write reg index 0x%08x: %d\n",
  			    index, ret);
  
-@@ -160,9 +159,6 @@ static int __must_check __smsc95xx_phy_wait_not_busy(struct usbnet *dev,
+@@ -147,9 +145,6 @@ static int __must_check smsc95xx_phy_wait_not_busy(struct usbnet *dev)
  	do {
- 		ret = __smsc95xx_read_reg(dev, MII_ADDR, &val, in_pm);
+ 		ret = smsc95xx_read_reg(dev, MII_ADDR, &val);
  		if (ret < 0) {
 -			/* Ignore -ENODEV error during disconnect() */
 -			if (ret == -ENODEV)
@@ -509,9 +522,9 @@ index 4e39e4345084..db8194973580 100644
  			netdev_warn(dev->net, "Error reading MII_ACCESS\n");
  			return ret;
  		}
-@@ -198,8 +194,7 @@ static int __smsc95xx_mdio_read(struct usbnet *dev, int phy_id, int idx,
+@@ -184,8 +179,7 @@ static int smsc95xx_mdio_read(struct usbnet *dev, int phy_id, int idx)
  	addr = mii_address_cmd(phy_id, idx, MII_READ_ | MII_BUSY_);
- 	ret = __smsc95xx_write_reg(dev, MII_ADDR, addr, in_pm);
+ 	ret = smsc95xx_write_reg(dev, MII_ADDR, addr);
  	if (ret < 0) {
 -		if (ret != -ENODEV)
 -			netdev_warn(dev->net, "Error writing MII_ADDR\n");
@@ -519,9 +532,9 @@ index 4e39e4345084..db8194973580 100644
  		goto done;
  	}
  
-@@ -211,8 +206,7 @@ static int __smsc95xx_mdio_read(struct usbnet *dev, int phy_id, int idx,
+@@ -197,8 +191,7 @@ static int smsc95xx_mdio_read(struct usbnet *dev, int phy_id, int idx)
  
- 	ret = __smsc95xx_read_reg(dev, MII_DATA, &val, in_pm);
+ 	ret = smsc95xx_read_reg(dev, MII_DATA, &val);
  	if (ret < 0) {
 -		if (ret != -ENODEV)
 -			netdev_warn(dev->net, "Error reading MII_DATA\n");
@@ -529,20 +542,19 @@ index 4e39e4345084..db8194973580 100644
  		goto done;
  	}
  
-@@ -220,10 +214,6 @@ static int __smsc95xx_mdio_read(struct usbnet *dev, int phy_id, int idx,
- 
+@@ -207,9 +200,6 @@ static int smsc95xx_mdio_read(struct usbnet *dev, int phy_id, int idx)
  done:
  	mutex_unlock(&dev->phy_mutex);
--
+ 
 -	/* Ignore -ENODEV error during disconnect() */
 -	if (ret == -ENODEV)
 -		return 0;
  	return ret;
  }
  
-@@ -245,8 +235,7 @@ static void __smsc95xx_mdio_write(struct usbnet *dev, int phy_id,
+@@ -231,8 +221,7 @@ static void smsc95xx_mdio_write(struct usbnet *dev, int phy_id, int idx,
  	val = regval;
- 	ret = __smsc95xx_write_reg(dev, MII_DATA, val, in_pm);
+ 	ret = smsc95xx_write_reg(dev, MII_DATA, val);
  	if (ret < 0) {
 -		if (ret != -ENODEV)
 -			netdev_warn(dev->net, "Error writing MII_DATA\n");
@@ -550,9 +562,9 @@ index 4e39e4345084..db8194973580 100644
  		goto done;
  	}
  
-@@ -254,8 +243,7 @@ static void __smsc95xx_mdio_write(struct usbnet *dev, int phy_id,
+@@ -240,8 +229,7 @@ static void smsc95xx_mdio_write(struct usbnet *dev, int phy_id, int idx,
  	addr = mii_address_cmd(phy_id, idx, MII_WRITE_ | MII_BUSY_);
- 	ret = __smsc95xx_write_reg(dev, MII_ADDR, addr, in_pm);
+ 	ret = smsc95xx_write_reg(dev, MII_ADDR, addr);
  	if (ret < 0) {
 -		if (ret != -ENODEV)
 -			netdev_warn(dev->net, "Error writing MII_ADDR\n");
@@ -560,12 +572,12 @@ index 4e39e4345084..db8194973580 100644
  		goto done;
  	}
  
-@@ -1056,19 +1044,11 @@ static const struct net_device_ops smsc95xx_netdev_ops = {
+@@ -1078,20 +1066,11 @@ static const struct net_device_ops smsc95xx_netdev_ops = {
  	.ndo_get_stats64	= dev_get_tstats64,
  	.ndo_set_mac_address 	= eth_mac_addr,
  	.ndo_validate_addr	= eth_validate_addr,
 -	.ndo_eth_ioctl		= smsc95xx_ioctl,
-+	.ndo_do_ioctl 		= smsc95xx_ioctl,
++	.ndo_do_ioctl		= smsc95xx_ioctl,
  	.ndo_set_rx_mode	= smsc95xx_set_multicast,
  	.ndo_set_features	= smsc95xx_set_features,
  };
@@ -575,17 +587,17 @@ index 4e39e4345084..db8194973580 100644
 -	struct usbnet *dev = netdev_priv(net);
 -
 -	phy_print_status(net->phydev);
+-	smsc95xx_mac_update_fullduplex(dev);
 -	usbnet_defer_kevent(dev, EVENT_LINK_CHANGE);
 -}
 -
  static int smsc95xx_bind(struct usbnet *dev, struct usb_interface *intf)
  {
  	struct smsc95xx_priv *pdata;
-@@ -1173,17 +1153,6 @@ static int smsc95xx_bind(struct usbnet *dev, struct usb_interface *intf)
- 	dev->net->min_mtu = ETH_MIN_MTU;
+@@ -1227,16 +1206,6 @@ static int smsc95xx_bind(struct usbnet *dev, struct usb_interface *intf)
  	dev->net->max_mtu = ETH_DATA_LEN;
  	dev->hard_mtu = dev->net->mtu + dev->net->hard_header_len;
--
+ 
 -	ret = phy_connect_direct(dev->net, pdata->phydev,
 -				 &smsc95xx_handle_link_change,
 -				 PHY_INTERFACE_MODE_MII);
@@ -599,14 +611,15 @@ index 4e39e4345084..db8194973580 100644
  	return 0;
  
  unregister_mdio:
-@@ -1201,24 +1170,44 @@ static void smsc95xx_unbind(struct usbnet *dev, struct usb_interface *intf)
+@@ -1263,7 +1232,6 @@ static void smsc95xx_unbind(struct usbnet *dev, struct usb_interface *intf)
  {
  	struct smsc95xx_priv *pdata = dev->driver_priv;
  
 -	phy_disconnect(dev->net->phydev);
  	mdiobus_unregister(pdata->mdiobus);
  	mdiobus_free(pdata->mdiobus);
- 	netif_dbg(dev, ifdown, dev->net, "free pdata\n");
+ 	irq_dispose_mapping(irq_find_mapping(pdata->irqdomain, PHY_HWIRQ));
+@@ -1273,16 +1241,39 @@ static void smsc95xx_unbind(struct usbnet *dev, struct usb_interface *intf)
  	kfree(pdata);
  }
  
@@ -625,7 +638,7 @@ index 4e39e4345084..db8194973580 100644
 +	ret = smsc95xx_reset(dev);
 +	if (ret < 0)
 +		return ret;
- 
++
 +	ret = phy_connect_direct(net, pdata->phydev,
 +				 &smsc95xx_handle_link_change,
 +				 PHY_INTERFACE_MODE_MII);
@@ -636,6 +649,7 @@ index 4e39e4345084..db8194973580 100644
 +
 +	phy_attached_info(net->phydev);
 +	phy_start(net->phydev);
+ 
  	return 0;
  }
  
@@ -643,15 +657,14 @@ index 4e39e4345084..db8194973580 100644
 +static int smsc95xx_disconnect_phy(struct usbnet *dev)
  {
  	phy_stop(dev->net->phydev);
--
 +	phy_disconnect(dev->net->phydev);
+ 
  	return 0;
  }
- 
-@@ -1972,9 +1961,8 @@ static const struct driver_info smsc95xx_info = {
+@@ -2005,9 +1996,8 @@ static const struct driver_info smsc95xx_info = {
+ 	.description	= "smsc95xx USB 2.0 Ethernet",
  	.bind		= smsc95xx_bind,
  	.unbind		= smsc95xx_unbind,
- 	.link_reset	= smsc95xx_link_reset,
 -	.reset		= smsc95xx_reset,
 -	.check_connect	= smsc95xx_start_phy,
 -	.stop		= smsc95xx_stop,
@@ -660,9 +673,9 @@ index 4e39e4345084..db8194973580 100644
  	.rx_fixup	= smsc95xx_rx_fixup,
  	.tx_fixup	= smsc95xx_tx_fixup,
  	.status		= smsc95xx_status,
-@@ -2073,12 +2061,17 @@ static const struct usb_device_id products[] = {
- 		USB_DEVICE(0x0424, 0x9E08),
- 		.driver_info = (unsigned long) &smsc95xx_info,
+@@ -2116,12 +2106,17 @@ static const struct usb_device_id products[] = {
+ 		USB_DEVICE(0x184F, 0x0051),
+ 		.driver_info = (unsigned long)&smsc95xx_info,
  	},
 +	{
 +		/* 10BASE-T1S USB Network Adapter */
@@ -679,3 +692,6 @@ index 4e39e4345084..db8194973580 100644
  	.id_table	= products,
  	.probe		= usbnet_probe,
  	.suspend	= smsc95xx_suspend,
+-- 
+2.43.0
+
